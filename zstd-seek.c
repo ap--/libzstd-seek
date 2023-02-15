@@ -10,14 +10,125 @@
 ****************************************************************** */
 
 #include <fcntl.h>
-#include <unistd.h>
+// #include <unistd.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <string.h>
 #include "zstd-seek.h"
+
+
+#ifdef _WIN32
+
+/* mmap() replacement for Windows
+ *
+ * Author: Mike Frysinger <vapier@gentoo.org>
+ * Placed into the public domain
+ */
+
+/* References:
+ * CreateFileMapping: http://msdn.microsoft.com/en-us/library/aa366537(VS.85).aspx
+ * CloseHandle:       http://msdn.microsoft.com/en-us/library/ms724211(VS.85).aspx
+ * MapViewOfFile:     http://msdn.microsoft.com/en-us/library/aa366761(VS.85).aspx
+ * UnmapViewOfFile:   http://msdn.microsoft.com/en-us/library/aa366882(VS.85).aspx
+ */
+
+#include <io.h>
+#include <windows.h>
+#include <sys/types.h>
+
+#define PROT_READ     0x1
+#define PROT_WRITE    0x2
+/* This flag is only available in WinXP+ */
+#ifdef FILE_MAP_EXECUTE
+#define PROT_EXEC     0x4
+#else
+#define PROT_EXEC        0x0
+#define FILE_MAP_EXECUTE 0
+#endif
+
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_ANON      MAP_ANONYMOUS
+#define MAP_FAILED    ((void *) -1)
+
+#ifdef __USE_FILE_OFFSET64
+# define DWORD_HI(x) (x >> 32)
+# define DWORD_LO(x) ((x) & 0xffffffff)
+#else
+# define DWORD_HI(x) (0)
+# define DWORD_LO(x) (x)
+#endif
+
+static void *mmap(void *start, size_t length, int prot, int flags, int fd, off_t offset)
+{
+	if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC))
+		return MAP_FAILED;
+	if (fd == -1) {
+		if (!(flags & MAP_ANON) || offset)
+			return MAP_FAILED;
+	} else if (flags & MAP_ANON)
+		return MAP_FAILED;
+
+	DWORD flProtect;
+	if (prot & PROT_WRITE) {
+		if (prot & PROT_EXEC)
+			flProtect = PAGE_EXECUTE_READWRITE;
+		else
+			flProtect = PAGE_READWRITE;
+	} else if (prot & PROT_EXEC) {
+		if (prot & PROT_READ)
+			flProtect = PAGE_EXECUTE_READ;
+		else if (prot & PROT_EXEC)
+			flProtect = PAGE_EXECUTE;
+	} else
+		flProtect = PAGE_READONLY;
+
+	off_t end = length + offset;
+	HANDLE mmap_fd, h;
+	if (fd == -1)
+		mmap_fd = INVALID_HANDLE_VALUE;
+	else
+		mmap_fd = (HANDLE)_get_osfhandle(fd);
+	h = CreateFileMapping(mmap_fd, NULL, flProtect, DWORD_HI(end), DWORD_LO(end), NULL);
+	if (h == NULL)
+		return MAP_FAILED;
+
+	DWORD dwDesiredAccess;
+	if (prot & PROT_WRITE)
+		dwDesiredAccess = FILE_MAP_WRITE;
+	else
+		dwDesiredAccess = FILE_MAP_READ;
+	if (prot & PROT_EXEC)
+		dwDesiredAccess |= FILE_MAP_EXECUTE;
+	if (flags & MAP_PRIVATE)
+		dwDesiredAccess |= FILE_MAP_COPY;
+	void *ret = MapViewOfFile(h, dwDesiredAccess, DWORD_HI(offset), DWORD_LO(offset), length);
+	if (ret == NULL) {
+		CloseHandle(h);
+		ret = MAP_FAILED;
+	}
+	return ret;
+}
+
+static void munmap(void *addr, size_t length)
+{
+	UnmapViewOfFile(addr);
+	/* ruh-ro, we leaked handle from CreateFileMapping() ... */
+}
+
+#undef DWORD_HI
+#undef DWORD_LO
+
+#else
+#include <sys/mmap.h>
+#endif
+
+
+
+
 
 typedef struct {
     size_t compressedOffset; //how may bytes to skip from the beginning of the compressed stream (skip to target frame)
@@ -135,7 +246,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
     void *buff = sctx->buff;
     size_t size = sctx->size;
 
-    void *footer = buff + (size - ZSTD_SEEK_TABLE_FOOTER_SIZE);
+    uint8_t *footer = (uint8_t *)buff + (size - ZSTD_SEEK_TABLE_FOOTER_SIZE);
     uint32_t magicnumber = ZSTDSeek_fromLE32(*((uint32_t *)(footer + 5)));
 
     if(magicnumber == ZSTD_SEEKABLE_MAGICNUMBER){
@@ -152,7 +263,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
             uint32_t const tableSize = sizePerEntry * numFrames;
             uint32_t const frameSize = tableSize + ZSTD_SEEK_TABLE_FOOTER_SIZE + ZSTD_SKIPPABLE_HEADER_SIZE;
 
-            void *frame = buff + (size - frameSize);
+            uint8_t *frame = (uint8_t *)buff + (size - frameSize);
             uint32_t skippableHeader = ZSTDSeek_fromLE32(*((uint32_t *)frame));
             if(skippableHeader != (ZSTD_MAGIC_SKIPPABLE_START|0xE)){
                 DEBUG("Last frame Header = %u does not match magic number %u. Ignoring malformed seektable.\n", skippableHeader, (ZSTD_MAGIC_SKIPPABLE_START|0xE));
@@ -161,7 +272,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
                 if(_frameSize + ZSTD_SKIPPABLE_HEADER_SIZE != frameSize){
                     DEBUG("Last frame size = %u does not match expected size = %u. Ignoring malformed seektable.\n", _frameSize + ZSTD_SKIPPABLE_HEADER_SIZE, frameSize);
                 }else{
-                    void *table = frame + ZSTD_SKIPPABLE_HEADER_SIZE;
+                    uint8_t *table = frame + ZSTD_SKIPPABLE_HEADER_SIZE;
                     size_t cOffset = 0;
                     size_t dOffset = 0;
                     for(uint32_t i = 0; i < numFrames; i++){
@@ -187,7 +298,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
         uncompressedPos = sctx->jt->records[sctx->jt->length-1].uncompressedPos;
     }
 
-    buff = sctx->buff + compressedPos;
+    buff = (uint8_t *)sctx->buff + compressedPos;
 
     sctx->jumpTableFullyInitialized = 1;
 
@@ -195,7 +306,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
         uint32_t const magic = ZSTDSeek_fromLE32(*((uint32_t *)buff));
         if((magic & ZSTD_MAGIC_SKIPPABLE_MASK) == ZSTD_MAGIC_SKIPPABLE_START){
             compressedPos += frameCompressedSize;
-            buff += frameCompressedSize;
+            buff = (uint8_t *)buff + frameCompressedSize;
             continue;
         }
 
@@ -236,7 +347,7 @@ int ZSTDSeek_initializeJumpTableUpUntilPos(ZSTDSeek_Context *sctx, size_t upUnti
 
         compressedPos += frameCompressedSize;
         uncompressedPos += frameContentSize;
-        buff += frameCompressedSize;
+        buff = (uint8_t *)buff + frameCompressedSize;
 
         if(uncompressedPos >= upUntilPos){
             sctx->jumpTableFullyInitialized = 0;
@@ -432,7 +543,7 @@ size_t ZSTDSeek_read(void *outBuff, size_t outBuffSize, ZSTDSeek_Context *sctx){
 
             memcpy(outBuff, sctx->tmpOutBuff+sctx->tmpOutBuffPos+sctx->jc.uncompressedOffset, toCopy);
             toRead -= toCopy;
-            outBuff += toCopy;
+            outBuff = (uint8_t *)outBuff + toCopy;
             sctx->currentUncompressedPos += toCopy;
             sctx->tmpOutBuffPos += toCopy + sctx->jc.uncompressedOffset;
             sctx->jc.uncompressedOffset = 0;
@@ -464,7 +575,7 @@ size_t ZSTDSeek_read(void *outBuff, size_t outBuffSize, ZSTDSeek_Context *sctx){
 
                 memcpy(outBuff, sctx->tmpOutBuff+sctx->tmpOutBuffPos+sctx->jc.uncompressedOffset, toCopy);
                 toRead -= toCopy;
-                outBuff += toCopy;
+                outBuff = (uint8_t *)outBuff + toCopy;
                 sctx->currentUncompressedPos += toCopy;
                 sctx->tmpOutBuffPos += toCopy + sctx->jc.uncompressedOffset;
                 sctx->jc.uncompressedOffset = 0;
@@ -525,7 +636,7 @@ int ZSTDSeek_seek(ZSTDSeek_Context *sctx, long offset, int origin){
 
             sctx->jc = new_jc;
 
-            sctx->inBuff = sctx->buff + sctx->jc.compressedOffset; //jump to the beginning of the frame..
+            sctx->inBuff = (uint8_t *)sctx->buff + sctx->jc.compressedOffset; //jump to the beginning of the frame..
             sctx->currentUncompressedPos = offset; //..and adjust the uncompressed position..
             sctx->currentCompressedPos = sctx->jc.compressedOffset;
             sctx->tmpOutBuffPos = 0; //..and reset the position in the tmp buffer
@@ -610,7 +721,7 @@ size_t ZSTDSeek_countFramesUpTo(ZSTDSeek_Context *sctx, size_t upTo){
 
     while ((frameCompressedSize = ZSTD_findFrameCompressedSize(buff, size))>0 && !ZSTD_isError(frameCompressedSize)) {
         counter++;
-        buff += frameCompressedSize;
+        buff = (uint8_t *)buff + frameCompressedSize;
         if(counter >= upTo){
             return upTo;
         }
