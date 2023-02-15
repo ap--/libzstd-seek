@@ -123,7 +123,7 @@ static void munmap(void *addr, size_t length)
 #undef DWORD_LO
 
 #else
-#include <sys/mmap.h>
+#include <sys/mman.h>
 #endif
 
 
